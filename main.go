@@ -9,43 +9,46 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"math/rand"
+	"github.com/davecgh/go-spew/spew"
+
 	// "syscall"
 	// "io"
-	// spew "github.com/davecgh/go-spew/spew"
 	"os"
 	"sync"
 )
 
 var wg sync.WaitGroup
-var link_list []link
+var linkList []link
 var host, full_host_url string
-var ok, no int
-var target string
 var file *os.File
 var finish bool
 var throttle <-chan time.Time
 
+var ignoredFileExtention = []string{".css", ".js", ".png", ".jpg", ".ico"}
+var badLinkRetryTimes = 5
+var requestTimeOut = 5 * time.Second
+var target = "http://www.geekpark.net"
+var maxConcurrenceQresuet = 1000
+
 type link struct {
-	url           string
-	status_code   int
-	duration      time.Duration
-	error_count   int
-	has_requested int
-	title string
+	url          string
+	status_code  int
+	duration     time.Duration
+	error_count  int
+	hasRequested int
+	title        string
 }
 
 func main() {
-	link_list_chan := make(chan []link, 1000)
+	link_list_chan := make(chan []link)
 
-
-	throttle = time.Tick(time.Duration(30 * time.Second))
+	throttle = time.Tick(time.Duration(1 * time.Second))
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	target = "http://www.geekpark.net"
-	prepare()
-	get_page_urls(target)
 
+	prepare()
+	getPageUrls(target)
+	// os.Exit(1)
 	for finish == false {
 		crawl(link_list_chan)
 	}
@@ -55,14 +58,14 @@ func main() {
 
 func prepare() {
 	init_file()
-	set_host(target)
+	set_host()
 }
 
 func init_file() {
 	file, _ = os.OpenFile("log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 }
 
-func set_host(target string) {
+func set_host() {
 	last_dot_index := strings.LastIndex(target, ".")
 	url_without_last_dot := target[:last_dot_index]
 	last_sec_dot_index := strings.Index(url_without_last_dot, ".")
@@ -75,45 +78,49 @@ func set_host(target string) {
 }
 
 func crawl(link_list_chan chan []link) {
-
 	for {
-		for k, v := range link_list {
-			go request(&link_list[k])
-			go get_page_urls(v.url)
-			go func() {
-				log.Println(runtime.NumGoroutine())
-			}()
+		for k, v := range linkList {
+			if runtime.NumGoroutine() < maxConcurrenceQresuet {
+				go request(&linkList[k])
+				go getPageUrls(v.url)
+			} else {
+				log.Println("Max requset,sleep in 2 second")
+				time.Sleep(2 * time.Second)
+				continue
+			}
 		}
-		go check_pending()
 		if finish == true {
 			break
 		}
+		checkAllRequested()
 		<-throttle
 	}
 }
 
-func check_pending() {
-	var request_count int
-	for _, v := range link_list {
-		if v.has_requested == 1 {
-			request_count++
+//check the all list has requested
+func checkAllRequested() {
+	var requestCount int
+	for _, v := range linkList {
+		if v.hasRequested == 1 {
+			requestCount++
 		}
 	}
-	if request_count == len(link_list) {
+
+	if requestCount == len(linkList) {
 		finish = true
 	}
 }
 
 func dialTimeout(network, addr string) (net.Conn, error) {
-	return net.DialTimeout(network, addr, time.Duration(15*time.Second))
+	return net.DialTimeout(network, addr, time.Duration(requestTimeOut))
 }
 
 func request(link *link) {
-	if link.has_requested == 1 {
+	if link.hasRequested == 1 {
 		return
 	}
-
-	var break_counter int
+	//bad request retry
+	var breakCounter int
 	var t0, t1 time.Time
 	transport := http.Transport{
 		Dial: dialTimeout,
@@ -129,91 +136,101 @@ func request(link *link) {
 		t1 = time.Now()
 
 		if err != nil {
-			log.Println(err)
-			link.status_code = 0
-			time.Sleep(time.Duration(rand.Int63n(10000)) * time.Millisecond)
-			break_counter++
-			if break_counter == 50 {
-				no++
+			breakCounter++
+			if breakCounter == badLinkRetryTimes {
+				file.WriteString(link.url + " " + strconv.Itoa(link.status_code) + "\n")
 				break
 			}
 		} else {
 			link.status_code = resp.StatusCode
-			get_title(link,resp)
-			file.WriteString(link.url + " " + t1.Sub(t0).String() + " " + strconv.Itoa(link.status_code) + " ok:" + strconv.Itoa(ok) + " no:" + strconv.Itoa(no) +link.title+"\n")
-			ok++
+			if link.status_code != 200 {
+				file.WriteString(link.url + " " + strconv.Itoa(link.status_code) + "\n")
+			}
+			spew.Dump(link.url)
+			get_title(link, resp)
 			break
 		}
 	}
-
-
 	link.duration = t1.Sub(t0)
-	link.error_count = break_counter
-	link.has_requested = 1
+	link.error_count = breakCounter
+	link.hasRequested = 1
 }
 
-func get_title(link *link,resp *http.Response) {
+func get_title(link *link, resp *http.Response) {
 	content, _ := ioutil.ReadAll(resp.Body)
-	content_str := string(content)
+	contentStr := string(content)
 
-	start_index :=strings.Index(content_str, "<title>")
-	end_index := strings.Index(content_str, "</title>")
+	startIndex := strings.Index(contentStr, "<title>")
+	endIndex := strings.Index(contentStr, "</title>")
 
-	if(start_index != -1 && end_index != -1){
-		link.title = content_str[start_index+7:end_index]
+	if startIndex != -1 && endIndex != -1 {
+		link.title = contentStr[startIndex+7 : endIndex]
 	}
 }
 
-func get_page_urls(url string) {
-
+func getPageUrls(url string) {
 	res, err := http.Get(url)
 	if err != nil {
+		file.WriteString(err.Error())
 		return
 	}
+
 	content, err := ioutil.ReadAll(res.Body)
 	defer res.Body.Close()
 	if err != nil {
+		file.WriteString(err.Error())
 		return
 	}
-	content_str := string(content)
 
+	contentStr := string(content)
+
+lookingForLink:
 	for {
-		start_index := strings.Index(content_str, "href=\"")
-		if start_index == -1 {
+		startIndex := strings.Index(contentStr, `href="`)
+		//check if it has looked entire page for href=
+		if startIndex == -1 {
 			break
 		}
-		new_str := content_str[start_index+6:]
 
-		new_str_end_index := strings.Index(new_str, "\"")
+		newStr := contentStr[startIndex+6:]
+		newStrEndIndex := strings.Index(newStr, `"`)
 
-		if new_str_end_index <= 6 {
-			content_str = new_str[2:]
-			continue
+		if newStrEndIndex <= 6 {
+			contentStr = newStr[2:]
+			continue lookingForLink
 		}
+		linkStr := newStr[:newStrEndIndex]
 
-		link_str := new_str[:new_str_end_index]
-		if string(link_str[0]) == "/" {
-			link_str = full_host_url + link_str
+		//check if linkSts is relative path.if so,change to absolute path.
+		if string(linkStr[0]) == "/" {
+			linkStr = full_host_url + linkStr
 		}
 
 		//check the links in pages blog to targe domain
 		//check http/https://xxx.host.com(len(xxx) = 20),
-		if index :=strings.Index(link_str,host); index == -1 || index > 20 {
-			content_str = new_str[new_str_end_index:]
-			continue
+		if index := strings.Index(linkStr, host); index == -1 || index > 20 {
+			contentStr = newStr[newStrEndIndex:]
+			continue lookingForLink
 		}
+		for _, v := range ignoredFileExtention {
+			if linkStr[len(linkStr)-4:len(linkStr)] == v {
+				contentStr = newStr[newStrEndIndex:]
+				continue lookingForLink
+			}
+		}
+		// spew.Dump(linkStr)
 
-		link_new := link{link_str, 0, 0, 0, 0,""}
-		link_list = append_if_missing(link_list, link_new)
-		content_str = new_str[new_str_end_index:]
+		linkNew := &link{linkStr, 0, 0, 0, 0, ""}
+		linkList = appendIfMissing(linkList, linkNew)
+		contentStr = newStr[newStrEndIndex:]
 	}
 }
 
-func append_if_missing(list []link, new_link link) []link {
+func appendIfMissing(list []link, new_link *link) []link {
 	for _, v := range list {
 		if v.url == new_link.url {
 			return list
 		}
 	}
-	return append(list, new_link)
+	return append(list, *new_link)
 }
