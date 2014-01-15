@@ -5,10 +5,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+	"github.com/beego/redigo/redis"
 	"github.com/davecgh/go-spew/spew"
 
 	// "syscall"
@@ -19,16 +21,17 @@ import (
 
 var wg sync.WaitGroup
 var linkList []link
+var hostList []string
 var host, full_host_url string
 var file *os.File
 var finish bool
 var throttle <-chan time.Time
 
 var ignoredFileExtention = []string{".css", ".js", ".png", ".jpg", ".ico"}
-var badLinkRetryTimes = 5
+var badLinkRetryTimes = 2
 var requestTimeOut = 5 * time.Second
-var target = "http://www.geekpark.net"
-var maxConcurrenceQresuet = 1000
+var target = "http://jwc.buu.edu.cn/"
+var maxConcurrenceQresuet = 100
 
 type link struct {
 	url          string
@@ -52,29 +55,18 @@ func main() {
 	for finish == false {
 		crawl(link_list_chan)
 	}
+	spew.Dump(linkList)
 	log.Println("finish!~")
 	defer file.Close()
 }
 
 func prepare() {
 	init_file()
-	set_host()
+	// full_host_url = set_host(target)
 }
 
 func init_file() {
 	file, _ = os.OpenFile("log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-}
-
-func set_host() {
-	last_dot_index := strings.LastIndex(target, ".")
-	url_without_last_dot := target[:last_dot_index]
-	last_sec_dot_index := strings.Index(url_without_last_dot, ".")
-	host = target[last_sec_dot_index+1:]
-	if host[len(host)-1:] == "/" {
-		host = host[:len(host)-1]
-	}
-
-	full_host_url = target[:strings.Index(target, host)] + host
 }
 
 func crawl(link_list_chan chan []link) {
@@ -133,6 +125,7 @@ func request(link *link) {
 	for {
 		t0 = time.Now()
 		resp, err := client.Get(link.url)
+
 		t1 = time.Now()
 
 		if err != nil {
@@ -146,7 +139,12 @@ func request(link *link) {
 			if link.status_code != 200 {
 				file.WriteString(link.url + " " + strconv.Itoa(link.status_code) + "\n")
 			}
-			spew.Dump(link.url)
+			hostList = appendIfMissing(hostList, resp.Request.Host).([]string)
+			client, err := redis.Dial("tcp", ":6379")
+			if err != nil {
+				file.WriteString(err.Error())
+			}
+			client.Do("SETNX", resp.Request.Host, "")
 			get_title(link, resp)
 			break
 		}
@@ -203,34 +201,45 @@ lookingForLink:
 
 		//check if linkSts is relative path.if so,change to absolute path.
 		if string(linkStr[0]) == "/" {
-			linkStr = full_host_url + linkStr
+			contentStr = newStr[newStrEndIndex:]
+			continue lookingForLink
 		}
 
 		//check the links in pages blog to targe domain
 		//check http/https://xxx.host.com(len(xxx) = 20),
-		if index := strings.Index(linkStr, host); index == -1 || index > 20 {
-			contentStr = newStr[newStrEndIndex:]
-			continue lookingForLink
-		}
+		// if index := strings.Index(linkStr, host); index != -1 || index > 20 {
+		// 	contentStr = newStr[newStrEndIndex:]
+		// 	continue lookingForLink
+		// }
 		for _, v := range ignoredFileExtention {
 			if linkStr[len(linkStr)-4:len(linkStr)] == v {
 				contentStr = newStr[newStrEndIndex:]
 				continue lookingForLink
 			}
 		}
-		// spew.Dump(linkStr)
-
 		linkNew := &link{linkStr, 0, 0, 0, 0, ""}
-		linkList = appendIfMissing(linkList, linkNew)
+		linkList = appendIfMissing(linkList, *linkNew).([]link)
 		contentStr = newStr[newStrEndIndex:]
 	}
 }
 
-func appendIfMissing(list []link, new_link *link) []link {
-	for _, v := range list {
-		if v.url == new_link.url {
-			return list
+func appendIfMissing(list interface{}, new_link interface{}) (linkList interface{}) {
+	if reflect.TypeOf(list).String() == "[]main.link" {
+		for _, v := range list.([]link) {
+			if v.url == new_link.(link).url {
+				return list.([]link)
+			}
 		}
+		linkList = append(list.([]link), new_link.(link))
 	}
-	return append(list, *new_link)
+	if reflect.TypeOf(list).String() == "[]string" {
+		for _, v := range list.([]string) {
+			if v == new_link.(string) {
+				return list.([]string)
+			}
+		}
+		spew.Dump(new_link.(string))
+		linkList = append(list.([]string), new_link.(string))
+	}
+	return linkList
 }
